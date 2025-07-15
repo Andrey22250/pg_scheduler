@@ -1,0 +1,7 @@
+# chep_extention.control
+
+comment = 'PostgreSQL Job Scheduler'
+default_version = '1.0'
+module_pathname = '$libdir/scheduler'
+superuser = true
+relocatable = false
