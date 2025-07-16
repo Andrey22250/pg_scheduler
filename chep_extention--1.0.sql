@@ -1,7 +1,7 @@
 -- Указание версии расширения
 CREATE EXTENSION IF NOT EXISTS plpgsql;
 
-CREATE SCHEMA IF NOT EXISTS scheduler;
+CREATE SCHEMA IF NOT EXISTS chep_scheduler;
 
 -- Таблица заданий
 CREATE TABLE scheduler.jobs (
@@ -43,12 +43,33 @@ CREATE TRIGGER trg_update_jobs_updated
     BEFORE UPDATE ON scheduler.jobs
     FOR EACH ROW EXECUTE FUNCTION scheduler.update_timestamp();
 
--- Функция расчёта next_run
+--- Функция расчёта next_run
 -- (парсер schedule_spec: разбор cron/interval/once)
 CREATE OR REPLACE FUNCTION scheduler.calculate_next_run(spec TEXT, last TIMESTAMPTZ) RETURNS TIMESTAMPTZ AS $$
+DECLARE
+    interval_prefix TEXT := 'interval ';
+    once_prefix TEXT := 'once at ';
+    cron_prefix TEXT := 'cron ';
+    interval_text TEXT;
+    once_time TIMESTAMPTZ;
+    cron_expr TEXT;
 BEGIN
-    -- TODO: реализовать разбор spec и возвращать TIMESTAMPTZ
-    RETURN last + INTERVAL '1 hour';
+    IF spec ILIKE interval_prefix || '%' THEN
+        interval_text := TRIM(BOTH ' ' FROM SUBSTRING(spec FROM LENGTH(interval_prefix)+1));
+        RETURN last + interval_text::interval;
+
+    ELSIF spec ILIKE once_prefix || '%' THEN
+        once_time := TRIM(BOTH ' ' FROM SUBSTRING(spec FROM LENGTH(once_prefix)+1))::timestamptz;
+        RETURN once_time;
+
+    ELSIF spec ILIKE cron_prefix || '%' THEN
+        -- Для упрощения: вызываем вспомогательную SQL-функцию (например, на основе pg_cron или pg_cron_next)
+        cron_expr := TRIM(BOTH ' ' FROM SUBSTRING(spec FROM LENGTH(cron_prefix)+1));
+        RETURN scheduler.cron_next_run(cron_expr, last);
+
+    ELSE
+        RAISE EXCEPTION 'Unknown schedule_spec format: %', spec;
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -56,7 +77,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION scheduler.set_next_run() RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.enabled THEN
-        NEW.next_run = scheduler.calculate_next_run(NEW.schedule_spec, NEW.last_run);
+        NEW.next_run = scheduler.calculate_next_run(NEW.schedule_spec, COALESCE(NEW.last_run, NOW()));
     ELSE
         NEW.next_run = NULL;
     END IF;
