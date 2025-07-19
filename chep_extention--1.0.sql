@@ -1,7 +1,7 @@
 -- Указание версии расширения
-CREATE EXTENSION IF NOT EXISTS plpgsql;
+CREATE EXTENSION IF NOT EXISTS chep_extention;
 
-CREATE SCHEMA IF NOT EXISTS chep_scheduler;
+CREATE SCHEMA IF NOT EXISTS chep_extention;
 
 -- Таблица заданий
 CREATE TABLE scheduler.jobs (
