@@ -9,7 +9,6 @@
 #include "utils/guc.h"
 #include "utils/elog.h"
 #include "utils/builtins.h"
-#include "libpq-fe.h"
 #include "pgstat.h"
 
 PG_MODULE_MAGIC;
@@ -25,45 +24,71 @@ void scheduler_main(Datum);
 static int64 parse_wake_interval(const char *s);
 
 /* Инициализация расширения */
+/**
+ * _PG_init() — точка входа при инициализации модуля
+ *
+ * Вызывается PostgreSQL при запуске, если расширение указано в
+ * shared_preload_libraries. Здесь регистрируются GUC-параметры
+ * и фоновый воркер, который будет периодически опрашивать таблицу scheduler.jobs.
+ */
 void _PG_init(void)
 {
-    DefineCustomStringVariable("scheduler.database",
-        "Target database for scheduler worker",
-        NULL,
+    BackgroundWorker worker;
+
+    /* Проверка: загружено ли через shared_preload_libraries */
+    if (!process_shared_preload_libraries_in_progress)
+    {
+        elog(WARNING, "[scheduler] Must be loaded via shared_preload_libraries");
+        return;
+    }
+
+    /* Регистрируем GUC-параметр: интервал между проверками заданий */
+    DefineCustomStringVariable(
+        "scheduler.wake_interval",
+        "Polling interval for scheduler (e.g., '10s', '2 min', '1h')",
+        "Supports time units: s, min, h, d, w, mon.",
+        &scheduler_wake_interval,
+        "10s",
+        PGC_POSTMASTER,  // Должно быть установлено при старте сервера
+        0,
+        NULL, NULL, NULL
+    );
+
+    /* Регистрируем GUC-параметр: имя базы данных с таблицей scheduler.jobs */
+    DefineCustomStringVariable(
+        "scheduler.database",
+        "Database that contains the scheduler schema and jobs",
+        "This database must include the 'scheduler.jobs' table.",
         &scheduler_database,
         "postgres",
         PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
+        0,
+        NULL, NULL, NULL
+    );
 
-    DefineCustomStringVariable("scheduler.wake_interval",
-        "Interval to check for jobs (e.g., 10s, 2 min)",
-        NULL,
-        &scheduler_wake_interval,
-        "10s",
-        PGC_POSTMASTER,
-        0, NULL, NULL, NULL);
-
-    MarkGUCPrefixReserved("scheduler");
-
-    /* парсим интервал сна */
+    /* Преобразуем интервал сна в микросекунды */
     scheduler_sleep_us = parse_wake_interval(scheduler_wake_interval);
 
-    BackgroundWorker worker = {
-        .bgw_name = "Scheduler Worker",
-        .bgw_type = "scheduler",
-        .bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION,
-        .bgw_start_time = BgWorkerStart_RecoveryFinished,
-        .bgw_restart_time = 10,
-        .bgw_main = scheduler_main,
-        .bgw_main_arg = (Datum) 0,
-        .bgw_notify_pid = 0,
-    };
+    /* Обнуляем структуру фонового воркера */
+    MemSet(&worker, 0, sizeof(BackgroundWorker));
 
-    snprintf(worker.bgw_library_name, BGW_MAXLEN, "scheduler");
-    snprintf(worker.bgw_function_name, BGW_MAXLEN, "scheduler_main");
+     /* Задаём имя процесса, которое будет видно в списке процессов PostgreSQL */
+    strlcpy(worker.bgw_name, "PostgreSQL Scheduler by Staryi", BGW_MAXLEN);
+    strlcpy(worker.bgw_type, "scheduler by Staryi", BGW_MAXLEN);
+    /* Флаги: доступ к shared memory и соединение с БД */
+    worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+    worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+    /* При сбое перезапускать через 5 секунд */
+    worker.bgw_restart_time = 5;
+    /* Указатель на основную функцию воркера */
+    worker.bgw_main_arg = (Datum) 0;
+    worker.bgw_notify_pid = 0;
 
+    /* Регистрация рабочего процесса */
     RegisterBackgroundWorker(&worker);
+    elog(LOG, "[scheduler] Background worker registered successfully");
 }
+
 
 /* Функция разбора интервала */
 static int64 parse_wake_interval(const char *s)
@@ -101,7 +126,7 @@ static int64 parse_wake_interval(const char *s)
     else if (strcmp(unit, "d") == 0 || strcmp(unit, "day") == 0)
         result = (int64)(value * 86400.0L * 1000000.0L);
     else
-        result = (int64)(value * 1000000.0L);  // default to seconds
+        result = (int64)(value * 1000000.0L);  // Изначально считаем в микросекундах
 
     return result;
 

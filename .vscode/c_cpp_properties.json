@@ -4,8 +4,8 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "/home/postgres/practice/pg17_install/include",
-                "/home/postgres/practice/pg17_install/include/server"
+                "/home/andrey/practic/pg17_install/include",
+                "/home/andrey/practic/pg17_install/include/postgresql/server"
             ],
             "defines": [],
             "cStandard": "c23",
