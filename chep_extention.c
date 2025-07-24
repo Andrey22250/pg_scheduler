@@ -1,15 +1,29 @@
 //chep_extention - это мой первый скедулер для PostgreSQL
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+
 #include "postgres.h"
 #include "fmgr.h"
 #include "miscadmin.h"
-#include "storage/latch.h"
-#include "storage/ipc.h"
-#include "postmaster/bgworker.h"
-#include "utils/guc.h"
-#include "utils/elog.h"
-#include "utils/builtins.h"
 #include "pgstat.h"
+
+#include "access/xact.h"
+#include "catalog/pg_type_d.h"
+#include "executor/spi.h"
+#include "postmaster/bgworker.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
+#include "storage/proc.h"
+#include "utils/builtins.h"
+#include "utils/elog.h"
+#include "utils/guc.h"
+#include "utils/memutils.h"
+#include "utils/snapmgr.h"
+#include "utils/timestamp.h"
+
+#include "limits.h"
+#include "string.h"
 
 PG_MODULE_MAGIC;
 
@@ -96,6 +110,8 @@ static int64 parse_wake_interval(const char *s)
     double value;
     char unit[8] = "";
     int64 result;
+    char *endptr = NULL;
+    int i = 0;
 
     if (s == NULL || *s == '\0')
         return 10 * 1000000L;
@@ -103,14 +119,12 @@ static int64 parse_wake_interval(const char *s)
     while (isspace((unsigned char)*s)) s++;
 
     errno = 0;
-    char *endptr = NULL;
     value = strtod(s, &endptr);
     if (errno != 0 || endptr == s || value < 0)
         goto fail;
 
     while (isspace((unsigned char)*endptr)) endptr++;
 
-    int i = 0;
     while (i < 7 && endptr[i] && isalpha((unsigned char)endptr[i])) {
         unit[i] = tolower((unsigned char)endptr[i]);
         i++;
@@ -135,68 +149,115 @@ fail:
     return 10 * 1000000L;
 }
 
-/* Главный цикл воркера */
+/* Обработчик SIGTERM */
+static volatile sig_atomic_t got_sigterm = false;
+static void scheduler_die(SIGNAL_ARGS)
+{
+    int save_errno = errno;
+    got_sigterm = true;
+    SetLatch(MyLatch);
+    errno = save_errno;
+}
+
+/* Главная функция фонового воркера */
 void scheduler_main(Datum arg)
 {
+    int rc;
+
+    /* Установка обработчика сигналов */
+    pqsignal(SIGTERM, scheduler_die);
     BackgroundWorkerUnblockSignals();
 
-    pqsignal(SIGTERM, die);
+    /* Подключение к целевой базе данных */
     BackgroundWorkerInitializeConnection(scheduler_database, NULL, 0);
+
+    elog(LOG, "[scheduler] Воркер запущен, wake_interval = %ld мкс", scheduler_sleep_us);
 
     while (!got_sigterm)
     {
-        int rc;
-
         rc = WaitLatch(MyLatch,
                        WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
                        scheduler_sleep_us / 1000,
                        PG_WAIT_EXTENSION);
 
-        ResetLatch(MyLatch);
-
+        /* Проверка завершения postmaster'а */
         if (rc & WL_POSTMASTER_DEATH)
             proc_exit(1);
 
-        StartTransactionCommand();
-        PushActiveSnapshot(GetTransactionSnapshot());
+        ResetLatch(MyLatch);
 
-        bool found_jobs = false;
-        SPI_connect();
-
-        const char *query =
-            "SELECT job_id FROM scheduler.jobs "
-            "WHERE enabled AND next_run <= now() "
-            "ORDER BY next_run "
-            "FOR UPDATE SKIP LOCKED";
-
-        int ret = SPI_execute(query, false, 0);
-        if (ret == SPI_OK_SELECT && SPI_processed > 0)
+        PG_TRY();
         {
-            found_jobs = true;
-            for (uint64 i = 0; i < SPI_processed; i++)
+            int spi_ret;
+            bool isnull;
+            uint64 i;
+            uint64 jobs_executed = 0;
+
+            const char *query_jobs =
+                "SELECT job_id FROM scheduler.jobs "
+                "WHERE enabled AND next_run <= now() "
+                "ORDER BY next_run "
+                "FOR UPDATE SKIP LOCKED";
+
+            if (SPI_connect() != SPI_OK_CONNECT)
             {
-                int32 job_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
-                                                           SPI_tuptable->tupdesc,
-                                                           1,
-                                                           NULL));
-                StringInfoData exec_sql;
-                initStringInfo(&exec_sql);
-                appendStringInfo(&exec_sql, "SELECT scheduler.execute_job(%d);", job_id);
-
-                SPI_execute(exec_sql.data, false, 0);
-                pfree(exec_sql.data);
+                elog(WARNING, "[scheduler] SPI_connect() не удался");
+                return;
             }
+
+            StartTransactionCommand();
+            PushActiveSnapshot(GetTransactionSnapshot());
+
+            spi_ret = SPI_execute(query_jobs, false, 0);
+            if (spi_ret == SPI_OK_SELECT && SPI_processed > 0)
+            {
+                for (i = 0; i < SPI_processed; i++)
+                {
+                    int32 job_id;
+                    char query_exec[128];
+
+                    job_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
+                                                         SPI_tuptable->tupdesc,
+                                                         1,
+                                                         &isnull));
+                    if (isnull)
+                        continue;
+
+                    snprintf(query_exec, sizeof(query_exec),
+                             "SELECT scheduler.execute_job(%d);", job_id);
+
+                    PG_TRY();
+                    {
+                        SPI_execute(query_exec, false, 0);
+                        jobs_executed++;
+                    }
+                    PG_CATCH();
+                    {
+                        EmitErrorReport();
+                        FlushErrorState();
+                        elog(WARNING, "[scheduler] Ошибка выполнения задания job_id=%d", job_id);
+                    }
+                    PG_END_TRY();
+                }
+            }
+
+            SPI_finish();
+            PopActiveSnapshot();
+            CommitTransactionCommand();
+
+            if (jobs_executed > 0)
+                elog(DEBUG1, "[scheduler] Выполнено %lu заданий", jobs_executed);
         }
-
-        SPI_finish();
-        PopActiveSnapshot();
-        CommitTransactionCommand();
-
-        if (!found_jobs)
+        PG_CATCH();
         {
-            pg_usleep(scheduler_sleep_us);
+            EmitErrorReport();
+            FlushErrorState();
+            AbortCurrentTransaction();
+            SPI_finish();
         }
+        PG_END_TRY();
     }
 
+    elog(LOG, "[scheduler] Завершение работы воркера");
     proc_exit(0);
 }
