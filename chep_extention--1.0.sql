@@ -1,7 +1,7 @@
 -- Указание версии расширения
-CREATE EXTENSION IF NOT EXISTS chep_extention;
+CREATE EXTENSION IF NOT EXISTS plpgsql;
 
-CREATE SCHEMA IF NOT EXISTS chep_extention;
+CREATE SCHEMA IF NOT EXISTS scheduler;
 
 -- Таблица заданий
 CREATE TABLE scheduler.jobs (
@@ -43,7 +43,7 @@ CREATE TRIGGER trg_update_jobs_updated
     BEFORE UPDATE ON scheduler.jobs
     FOR EACH ROW EXECUTE FUNCTION scheduler.update_timestamp();
 
---- Функция расчёта next_run
+-- Функция расчёта next_run
 -- (парсер schedule_spec: разбор cron/interval/once)
 CREATE OR REPLACE FUNCTION scheduler.calculate_next_run(spec TEXT, last TIMESTAMPTZ) RETURNS TIMESTAMPTZ AS $$
 DECLARE
@@ -106,5 +106,140 @@ BEGIN
           max_attempts = EXCLUDED.max_attempts,
           enabled = TRUE,
           current_attempts = 0;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Enable or disable a job by name
+CREATE OR REPLACE FUNCTION scheduler.toggle_job(
+    p_name TEXT,
+    p_enabled BOOLEAN
+) RETURNS VOID AS $$
+BEGIN
+    UPDATE scheduler.jobs
+       SET enabled = p_enabled
+     WHERE job_name = p_name;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Job % not found', p_name;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Delete a job and its logs
+CREATE OR REPLACE FUNCTION scheduler.delete_job(
+    p_name TEXT
+) RETURNS VOID AS $$
+BEGIN
+    DELETE FROM scheduler.jobs WHERE job_name = p_name;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Job % not found', p_name;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Функция вычисления следующего времени запуска на основе cron-выражения
+CREATE OR REPLACE FUNCTION scheduler.cron_next_run(
+    cron_expr TEXT,
+    base_time TIMESTAMPTZ
+) RETURNS TIMESTAMPTZ AS $$
+DECLARE
+    parts TEXT[];         -- массив из частей cron-выражения
+    cron_min TEXT;        -- минуты
+    cron_hour TEXT;       -- часы
+    cron_dom TEXT;        -- день месяца
+    cron_month TEXT;      -- месяц
+    cron_dow TEXT;        -- день недели
+    ts TIMESTAMPTZ;       -- временная метка для проверки
+BEGIN
+    -- Разбиваем выражение на 5 частей: min hour day month dow
+    parts := string_to_array(cron_expr, ' ');
+    IF array_length(parts,1) <> 5 THEN
+        RAISE EXCEPTION 'Неверное cron-выражение: %', cron_expr;
+    END IF;
+    cron_min   := parts[1];
+    cron_hour  := parts[2];
+    cron_dom   := parts[3];
+    cron_month := parts[4];
+    cron_dow   := parts[5];
+
+    -- Итерируемся по каждой минуте от base_time +1мин до base_time+1месяц
+    FOR ts IN SELECT generate_series(
+                    date_trunc('minute', base_time) + interval '1 minute',
+                    base_time + interval '1 month',
+                    interval '1 minute')
+    LOOP
+        -- Проверяем соответствие каждого компонента выражению или wildcard '*'
+        IF (cron_min = '*' OR to_char(ts, 'MI') = lpad(cron_min,2,'0'))
+        AND (cron_hour = '*' OR to_char(ts, 'HH24') = lpad(cron_hour,2,'0'))
+        AND (cron_dom = '*' OR to_char(ts, 'DD') = lpad(cron_dom,2,'0'))
+        AND (cron_month = '*' OR to_char(ts, 'MM') = lpad(cron_month,2,'0'))
+        AND (cron_dow = '*' OR to_char(ts, 'D') = cron_dow)
+        THEN
+            RETURN ts;  -- найден подходящий момент
+        END IF;
+    END LOOP;
+
+    -- Если не найдено, выбрасываем ошибку
+    RAISE EXCEPTION 'Не удалось найти следующий запуск для % после %', cron_expr, base_time;
+END;
+$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
+
+-- Execute a job by ID, log results and compute next_run
+CREATE OR REPLACE FUNCTION scheduler.execute_job(
+    p_job_id INT
+) RETURNS VOID AS $$
+DECLARE
+    rec RECORD;
+    start_ts TIMESTAMPTZ;
+    duration INTERVAL;
+    status TEXT;
+    msg TEXT;
+BEGIN
+    -- Lock job row
+    SELECT * INTO rec
+      FROM scheduler.jobs
+     WHERE job_id = p_job_id
+     FOR UPDATE;
+
+    start_ts := now();
+
+    -- Execute command
+    BEGIN
+        IF rec.job_type = 'sql' THEN
+            EXECUTE rec.command;
+        ELSIF rec.job_type = 'shell' THEN
+            -- Выполнение shell-команды через COPY PROGRAM
+            EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', rec.command);
+        ELSE
+            RAISE EXCEPTION 'Unknown job_type: %', rec.job_type;
+        END IF;
+        status := 'success';
+        msg := '';
+    EXCEPTION WHEN OTHERS THEN
+        status := 'failure';
+        msg := SQLERRM;
+    END;
+
+    duration := now() - start_ts;
+
+    -- Insert into logs
+    INSERT INTO scheduler.job_logs(job_id, run_time, status, message, duration)
+    VALUES (p_job_id, start_ts, status, msg, duration);
+
+    -- Update job metadata
+    UPDATE scheduler.jobs
+       SET last_run = start_ts,
+           last_status = status,
+           last_message = msg,
+           current_attempts = CASE WHEN status = 'failure' THEN rec.current_attempts + 1 ELSE 0 END,
+           enabled = CASE
+                         WHEN status = 'failure' AND rec.current_attempts + 1 >= rec.max_attempts THEN FALSE
+                         ELSE TRUE
+                     END,
+           next_run = CASE
+                          WHEN enabled THEN scheduler.calculate_next_run(rec.schedule_spec, start_ts)
+                          ELSE NULL
+                      END
+     WHERE job_id = p_job_id;
 END;
 $$ LANGUAGE plpgsql;

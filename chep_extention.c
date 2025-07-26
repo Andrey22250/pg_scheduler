@@ -159,16 +159,37 @@ static void scheduler_die(SIGNAL_ARGS)
     errno = save_errno;
 }
 
+/* Безопасное выполнение одного задания */
+static void execute_job_safely(int32 job_id)
+{
+    char query_exec[128];
+    int ret;
+
+    snprintf(query_exec, sizeof(query_exec),
+             "SELECT scheduler.execute_job(%d);", job_id);
+
+    PG_TRY();
+    {
+        ret = SPI_execute(query_exec, false, 0);
+        if (ret != SPI_OK_SELECT)
+            elog(WARNING, "[scheduler] scheduler.execute_job(%d) вернул код %d", job_id, ret);
+    }
+    PG_CATCH();
+    {
+        EmitErrorReport();
+        FlushErrorState();
+        elog(WARNING, "[scheduler] Исключение при выполнении задания job_id = %d", job_id);
+    }
+    PG_END_TRY();
+}
+
 /* Главная функция фонового воркера */
 void scheduler_main(Datum arg)
 {
     int rc;
 
-    /* Установка обработчика сигналов */
     pqsignal(SIGTERM, scheduler_die);
     BackgroundWorkerUnblockSignals();
-
-    /* Подключение к целевой базе данных */
     BackgroundWorkerInitializeConnection(scheduler_database, NULL, 0);
 
     elog(LOG, "[scheduler] Воркер запущен, wake_interval = %ld мкс", scheduler_sleep_us);
@@ -180,7 +201,6 @@ void scheduler_main(Datum arg)
                        scheduler_sleep_us / 1000,
                        PG_WAIT_EXTENSION);
 
-        /* Проверка завершения postmaster'а */
         if (rc & WL_POSTMASTER_DEATH)
             proc_exit(1);
 
@@ -189,10 +209,9 @@ void scheduler_main(Datum arg)
         PG_TRY();
         {
             int spi_ret;
-            bool isnull;
             uint64 i;
             uint64 jobs_executed = 0;
-
+            bool isnull;
             const char *query_jobs =
                 "SELECT job_id FROM scheduler.jobs "
                 "WHERE enabled AND next_run <= now() "
@@ -201,7 +220,7 @@ void scheduler_main(Datum arg)
 
             if (SPI_connect() != SPI_OK_CONNECT)
             {
-                elog(WARNING, "[scheduler] SPI_connect() не удался");
+                elog(WARNING, "[scheduler] Не удалось выполнить SPI_connect()");
                 return;
             }
 
@@ -213,31 +232,15 @@ void scheduler_main(Datum arg)
             {
                 for (i = 0; i < SPI_processed; i++)
                 {
-                    int32 job_id;
-                    char query_exec[128];
-
-                    job_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
-                                                         SPI_tuptable->tupdesc,
-                                                         1,
-                                                         &isnull));
+                    int32 job_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
+                                                               SPI_tuptable->tupdesc,
+                                                               1,
+                                                               &isnull));
                     if (isnull)
                         continue;
 
-                    snprintf(query_exec, sizeof(query_exec),
-                             "SELECT scheduler.execute_job(%d);", job_id);
-
-                    PG_TRY();
-                    {
-                        SPI_execute(query_exec, false, 0);
-                        jobs_executed++;
-                    }
-                    PG_CATCH();
-                    {
-                        EmitErrorReport();
-                        FlushErrorState();
-                        elog(WARNING, "[scheduler] Ошибка выполнения задания job_id=%d", job_id);
-                    }
-                    PG_END_TRY();
+                    execute_job_safely(job_id);
+                    jobs_executed++;
                 }
             }
 
