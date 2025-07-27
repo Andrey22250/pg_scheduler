@@ -1,6 +1,3 @@
--- Указание версии расширения
-CREATE EXTENSION IF NOT EXISTS plpgsql;
-
 CREATE SCHEMA IF NOT EXISTS scheduler;
 
 -- Таблица заданий
@@ -105,7 +102,9 @@ BEGIN
           schedule_spec = EXCLUDED.schedule_spec,
           max_attempts = EXCLUDED.max_attempts,
           enabled = TRUE,
-          current_attempts = 0;
+          current_attempts = 0,
+          last_run = now(),
+          next_run = scheduler.calculate_next_run(EXCLUDED.schedule_spec, now());
 END;
 $$ LANGUAGE plpgsql;
 
@@ -181,7 +180,6 @@ BEGIN
     -- Если не найдено, выбрасываем ошибку
     RAISE EXCEPTION 'Не удалось найти следующий запуск для % после %', cron_expr, base_time;
 END;
-$$ LANGUAGE plpgsql;
 $$ LANGUAGE plpgsql;
 
 -- Execute a job by ID, log results and compute next_run

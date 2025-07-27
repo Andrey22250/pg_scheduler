@@ -89,6 +89,8 @@ void _PG_init(void)
      /* Задаём имя процесса, которое будет видно в списке процессов PostgreSQL */
     strlcpy(worker.bgw_name, "PostgreSQL Scheduler by Staryi", BGW_MAXLEN);
     strlcpy(worker.bgw_type, "scheduler by Staryi", BGW_MAXLEN);
+    strlcpy(worker.bgw_library_name, "chep_extention", BGW_MAXLEN);
+    strlcpy(worker.bgw_function_name, "scheduler_main", BGW_MAXLEN);
     /* Флаги: доступ к shared memory и соединение с БД */
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
     worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
@@ -183,6 +185,8 @@ static void execute_job_safely(int32 job_id)
     PG_END_TRY();
 }
 
+PGDLLEXPORT void scheduler_main(Datum arg);
+
 /* Главная функция фонового воркера */
 void scheduler_main(Datum arg)
 {
@@ -200,9 +204,11 @@ void scheduler_main(Datum arg)
                        WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
                        scheduler_sleep_us / 1000,
                        PG_WAIT_EXTENSION);
-
         if (rc & WL_POSTMASTER_DEATH)
+        {
+            elog(LOG, "[scheduler] Обнаружена остановка postmaster, завершаем работу.");
             proc_exit(1);
+        }
 
         ResetLatch(MyLatch);
 
@@ -215,41 +221,60 @@ void scheduler_main(Datum arg)
             const char *query_jobs =
                 "SELECT job_id FROM scheduler.jobs "
                 "WHERE enabled AND next_run <= now() "
-                "ORDER BY next_run "
-                "FOR UPDATE SKIP LOCKED";
-
-            if (SPI_connect() != SPI_OK_CONNECT)
-            {
-                elog(WARNING, "[scheduler] Не удалось выполнить SPI_connect()");
-                return;
-            }
+                "ORDER BY next_run ";
 
             StartTransactionCommand();
             PushActiveSnapshot(GetTransactionSnapshot());
 
-            spi_ret = SPI_execute(query_jobs, false, 0);
-            if (spi_ret == SPI_OK_SELECT && SPI_processed > 0)
+            if (SPI_connect() != SPI_OK_CONNECT)
             {
-                for (i = 0; i < SPI_processed; i++)
-                {
-                    int32 job_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
-                                                               SPI_tuptable->tupdesc,
-                                                               1,
-                                                               &isnull));
-                    if (isnull)
-                        continue;
-
-                    execute_job_safely(job_id);
-                    jobs_executed++;
-                }
+                elog(WARNING, "[scheduler] Не удалось выполнить SPI_connect()");
+                PopActiveSnapshot();
+                CommitTransactionCommand();
+                PG_RE_THROW();
             }
 
+            elog(LOG, "[scheduler] Выполняем запрос на выборку заданий.");
+
+            spi_ret = SPI_execute(query_jobs, false, 0);
+            elog(LOG, "Количество найденных строк: %ld", SPI_processed);
+            if (spi_ret == SPI_OK_SELECT)
+            {
+                if (SPI_processed == 0)
+                {
+                    elog(LOG, "[scheduler] Нет заданий для выполнения");
+                }
+
+                if (SPI_processed > 0)
+                {
+                    elog(LOG, "[scheduler] Найдено заданий: %lu", SPI_processed);
+                    for (i = 0; i < SPI_processed; i++)
+                    {
+                        int32 job_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
+                                                                  SPI_tuptable->tupdesc,
+                                                                  1,
+                                                                  &isnull));
+                        if (isnull)
+                        {
+                            elog(WARNING, "[scheduler] Пропускаем запись с NULL job_id.");
+                            continue;
+                        }
+
+                        elog(LOG, "[scheduler] Выполняем задание с job_id = %d", job_id);
+
+                        execute_job_safely(job_id);
+                        jobs_executed++;
+                    }
+                }
+            }
+            else
+            {
+                elog(WARNING, "[scheduler] Ошибка выполнения SPI_execute: код %d", spi_ret);
+            }
+            elog(LOG, "[scheduler] Транзакция завершена, выполнено заданий: %lu", jobs_executed);
             SPI_finish();
             PopActiveSnapshot();
             CommitTransactionCommand();
-
-            if (jobs_executed > 0)
-                elog(DEBUG1, "[scheduler] Выполнено %lu заданий", jobs_executed);
         }
         PG_CATCH();
         {
@@ -257,6 +282,7 @@ void scheduler_main(Datum arg)
             FlushErrorState();
             AbortCurrentTransaction();
             SPI_finish();
+            PopActiveSnapshot();
         }
         PG_END_TRY();
     }
