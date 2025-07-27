@@ -169,7 +169,7 @@ static void execute_job_safely(int32 job_id)
 
     snprintf(query_exec, sizeof(query_exec),
              "SELECT scheduler.execute_job(%d);", job_id);
-
+    elog(LOG, "[scheduler] scheduler.execute_job(%d) вернул код", job_id);
     PG_TRY();
     {
         ret = SPI_execute(query_exec, false, 0);
@@ -215,66 +215,88 @@ void scheduler_main(Datum arg)
         PG_TRY();
         {
             int spi_ret;
-            uint64 i;
             uint64 jobs_executed = 0;
             bool isnull;
+
             const char *query_jobs =
                 "SELECT job_id FROM scheduler.jobs "
-                "WHERE enabled AND next_run <= now() "
-                "ORDER BY next_run ";
+                "WHERE enabled AND next_run <= now() ";
 
             StartTransactionCommand();
             PushActiveSnapshot(GetTransactionSnapshot());
 
             if (SPI_connect() != SPI_OK_CONNECT)
             {
-                elog(WARNING, "[scheduler] Не удалось выполнить SPI_connect()");
+                elog(WARNING, "[scheduler] SPI_connect() не удался");
                 PopActiveSnapshot();
                 CommitTransactionCommand();
                 PG_RE_THROW();
             }
 
-            elog(LOG, "[scheduler] Выполняем запрос на выборку заданий.");
+            elog(LOG, "[scheduler] Ищем задания для выполнения...");
 
             spi_ret = SPI_execute(query_jobs, false, 0);
-            elog(LOG, "Количество найденных строк: %ld", SPI_processed);
-            if (spi_ret == SPI_OK_SELECT)
+            if (spi_ret != SPI_OK_SELECT)
             {
-                if (SPI_processed == 0)
+                elog(WARNING, "[scheduler] Ошибка SPI_execute: код %d", spi_ret);
+                SPI_finish();
+                PopActiveSnapshot();
+                CommitTransactionCommand();
+                PG_RE_THROW();
+            }
+
+            elog(LOG, "[scheduler] Найдено заданий: %lu", SPI_processed);
+
+            for (uint64 i = 0; i < SPI_processed; i++)
+            {
+                Datum job_datum = SPI_getbinval(SPI_tuptable->vals[i],
+                                                SPI_tuptable->tupdesc,
+                                                1,
+                                                &isnull);
+                if (isnull)
                 {
-                    elog(LOG, "[scheduler] Нет заданий для выполнения");
+                    elog(WARNING, "[scheduler] NULL job_id — пропущено");
+                    continue;
                 }
 
-                if (SPI_processed > 0)
+                int32 job_id = DatumGetInt32(job_datum);
+
+                elog(LOG, "[scheduler] Получен job_id = %d, начинаем выполнение", job_id);
+
+                // Завершаем текущую транзакцию выборки
+                SPI_finish();
+                PopActiveSnapshot();
+                CommitTransactionCommand();
+
+                // Выполнение задания в отдельной транзакции
+                StartTransactionCommand();
+                PushActiveSnapshot(GetTransactionSnapshot());
+                if (SPI_connect() == SPI_OK_CONNECT)
                 {
-                    elog(LOG, "[scheduler] Найдено заданий: %lu", SPI_processed);
-                    for (i = 0; i < SPI_processed; i++)
-                    {
-                        int32 job_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i],
-                                                                  SPI_tuptable->tupdesc,
-                                                                  1,
-                                                                  &isnull));
-                        if (isnull)
-                        {
-                            elog(WARNING, "[scheduler] Пропускаем запись с NULL job_id.");
-                            continue;
-                        }
+                    execute_job_safely(job_id);
+                    SPI_finish();
+                }
+                PopActiveSnapshot();
+                CommitTransactionCommand();
 
-                        elog(LOG, "[scheduler] Выполняем задание с job_id = %d", job_id);
+                jobs_executed++;
 
-                        execute_job_safely(job_id);
-                        jobs_executed++;
-                    }
+                // Возобновим транзакцию выборки для следующего job_id
+                StartTransactionCommand();
+                PushActiveSnapshot(GetTransactionSnapshot());
+                if (SPI_connect() != SPI_OK_CONNECT)
+                {
+                    elog(WARNING, "[scheduler] SPI_connect() после выполнения job не удался");
+                    PG_RE_THROW();
                 }
             }
-            else
-            {
-                elog(WARNING, "[scheduler] Ошибка выполнения SPI_execute: код %d", spi_ret);
-            }
-            elog(LOG, "[scheduler] Транзакция завершена, выполнено заданий: %lu", jobs_executed);
+
+            // Завершаем финальную транзакцию
             SPI_finish();
             PopActiveSnapshot();
             CommitTransactionCommand();
+
+            elog(LOG, "[scheduler] Цикл завершён, выполнено заданий: %lu", jobs_executed);
         }
         PG_CATCH();
         {
