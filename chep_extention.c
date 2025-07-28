@@ -231,8 +231,7 @@ void scheduler_main(Datum arg)
         {
             const char *query_jobs =
                 "SELECT job_id FROM scheduler.jobs "
-                "WHERE enabled AND next_run <= now() "
-                "FOR UPDATE SKIP LOCKED";
+                "WHERE enabled AND next_run <= now() ";
 
             int spi_ret;
             uint64 jobs_executed = 0;
