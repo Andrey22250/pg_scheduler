@@ -180,7 +180,6 @@ static void execute_job_safely(int32 job_id)
         if (SPI_connect() != SPI_OK_CONNECT)
         {
             elog(WARNING, "[scheduler] SPI_connect() не удался в execute_job_safely()");
-            PG_RE_THROW();
         }
 
         ret = SPI_execute(query_exec, false, 0);
@@ -227,18 +226,21 @@ void scheduler_main(Datum arg)
 
         ResetLatch(MyLatch);
 
+        // Объявляем переменные здесь для видимости в PG_CATCH
+        int32 *job_ids = NULL;
+        uint64 job_count = 0;
+
         PG_TRY();
         {
             const char *query_jobs =
                 "SELECT job_id FROM scheduler.jobs "
-                "WHERE enabled AND next_run <= now() ";
+                "WHERE enabled AND next_run <= now() "         
+                "FOR UPDATE SKIP LOCKED";
 
             int spi_ret;
             uint64 jobs_executed = 0;
             bool isnull;
 
-            int32 *job_ids = NULL;
-            uint64 job_count = 0;
             // Запоминаем контекст до подключения SPI (он переживет SPI_finish)
             MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
             StartTransactionCommand();
@@ -300,9 +302,15 @@ void scheduler_main(Datum arg)
         }
         PG_CATCH();
         {
+            elog(LOG, "[scheduler] Цикл завершён, выполнено заданий: ");
+            // Освобождаем память при ошибке
+            if (job_ids)
+                pfree(job_ids);
+            job_ids = NULL;
+
             EmitErrorReport();
             FlushErrorState();
-            AbortCurrentTransaction();
+            AbortCurrentTransaction();  // Откатываем транзакцию при ошибке
         }
         PG_END_TRY();
     }

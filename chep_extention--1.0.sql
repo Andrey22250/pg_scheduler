@@ -196,8 +196,7 @@ BEGIN
     -- Lock job row
     SELECT * INTO rec
       FROM scheduler.jobs
-     WHERE job_id = p_job_id
-     FOR UPDATE;
+     WHERE job_id = p_job_id;
 
     start_ts := now();
 
