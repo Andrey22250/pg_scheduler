@@ -103,8 +103,8 @@ BEGIN
           max_attempts = EXCLUDED.max_attempts,
           enabled = TRUE,
           current_attempts = 0,
-          last_run = now(),
-          next_run = scheduler.calculate_next_run(EXCLUDED.schedule_spec, now());
+          last_run = NOW(),
+          next_run = scheduler.calculate_next_run(EXCLUDED.schedule_spec, NOW());
 END;
 $$ LANGUAGE plpgsql;
 
@@ -198,7 +198,7 @@ BEGIN
       FROM scheduler.jobs
      WHERE job_id = p_job_id;
 
-    start_ts := now();
+    start_ts := clock_timestamp();
 
     -- Execute command
     BEGIN
@@ -217,7 +217,7 @@ BEGIN
         msg := SQLERRM;
     END;
 
-    duration := now() - start_ts;
+    duration := clock_timestamp() - start_ts;
 
     -- Insert into logs
     INSERT INTO scheduler.job_logs(job_id, run_time, status, message, duration)

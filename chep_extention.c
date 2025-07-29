@@ -214,6 +214,8 @@ void scheduler_main(Datum arg)
 
     while (!got_sigterm)
     {
+        ResetLatch(MyLatch);
+
         rc = WaitLatch(MyLatch,
                        WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
                        scheduler_sleep_us / 1000,
@@ -224,8 +226,6 @@ void scheduler_main(Datum arg)
             proc_exit(1);
         }
 
-        ResetLatch(MyLatch);
-
         // Объявляем переменные здесь для видимости в PG_CATCH
         int32 *job_ids = NULL;
         uint64 job_count = 0;
@@ -234,7 +234,7 @@ void scheduler_main(Datum arg)
         {
             const char *query_jobs =
                 "SELECT job_id FROM scheduler.jobs "
-                "WHERE enabled AND next_run <= now() "         
+                "WHERE enabled AND next_run <= clock_timestamp() "  // Используем clock_timestamp() для точного времени       
                 "FOR UPDATE SKIP LOCKED";
 
             int spi_ret;
@@ -242,7 +242,6 @@ void scheduler_main(Datum arg)
             bool isnull;
 
             // Запоминаем контекст до подключения SPI (он переживет SPI_finish)
-            MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
             StartTransactionCommand();
             PushActiveSnapshot(GetTransactionSnapshot());
 
@@ -259,7 +258,9 @@ void scheduler_main(Datum arg)
             {
                 elog(LOG, "[scheduler] Найдено заданий: %ld", job_count);
                 // ВАЖНО: выделяем в старом контексте (не SPI)
-                job_ids = (int32 *) MemoryContextAlloc(oldcontext, sizeof(int32) * job_count);
+                MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+                job_ids = (int32 *) palloc(sizeof(int32) * job_count);
+                MemoryContextSwitchTo(oldcontext);  // Возвращаем контекст!
 
                 for (uint64 i = 0; i < job_count; i++)
                 {
