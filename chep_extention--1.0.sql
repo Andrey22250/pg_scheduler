@@ -230,13 +230,15 @@ BEGIN
            last_message = msg,
            current_attempts = CASE WHEN status = 'failure' THEN rec.current_attempts + 1 ELSE 0 END,
            enabled = CASE
-                         WHEN status = 'failure' AND rec.current_attempts + 1 >= rec.max_attempts THEN FALSE
-                         ELSE TRUE
-                     END,
-           next_run = CASE
-                          WHEN enabled THEN scheduler.calculate_next_run(rec.schedule_spec, start_ts)
-                          ELSE NULL
-                      END
+                WHEN rec.schedule_spec ILIKE 'once at %' THEN FALSE
+                WHEN status = 'failure' AND rec.current_attempts + 1 >= rec.max_attempts THEN FALSE
+                ELSE TRUE
+            END,
+            next_run = CASE
+                WHEN rec.schedule_spec ILIKE 'once at %' THEN NULL
+                WHEN enabled THEN scheduler.calculate_next_run(rec.schedule_spec, start_ts)
+                ELSE NULL
+            END
      WHERE job_id = p_job_id;
 END;
 $$ LANGUAGE plpgsql;
